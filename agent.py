@@ -1,73 +1,129 @@
 """
-agent.py
-Plantilla oficial de l'agent de control per al repte de la bateria de UPC Sostenible.
-Datathon 2026.
+agent.py - Repte UPC Sostenible (Datathon 2026)
+
+Controlador predictiu (MPC) amb programació lineal.
+
+Cada hora:
+  1. Construeix el cost combinat w_t = 0.7*co2_t/CO2_REF + 0.3*preu_t/PREU_REF
+     per a les 24 h conegudes i, opcionalment, una extensió prevista (perfil per hora).
+  2. Preveu el consum net (consum - solar) de cada hora vinent amb l'historial.
+  3. Resol un LP: minimitzar sum(w_t * importacio_t) - valor_final * SOC_final
+     amb importacio_t >= consum_net_t + carrega_t - descarrega_t, importacio_t >= 0.
+  4. Aplica la decisió de la primera hora i la retalla per seguretat (0 infraccions).
 """
 
-# import joblib  # Descomenteu si utilitzeu models serialitzats (.pkl)
+from collections import deque
+import numpy as np
+from scipy.optimize import linprog
+
 
 class BatteryAgent:
-    def __init__(self):
-        """Inicialització de l'agent.
-        S'executa una sola vegada a l'inici del període d'avaluació.
-        Permet carregar models predictius o definir llindars d'operació.
-        """
-        # Paràmetres d'operació de la política de referència
-        self.llindar_preu_carrega = 0.08      # €/kWh
-        self.llindar_preu_descarrega = 0.16   # €/kWh
-        self.potencia_nominal_kw = 500.0      # Potència màxima de l'inversor (kW)
+    
+    CAP = 2000.0
+    PMAX = 500.0
+    ETA = 0.9 ** 0.5
+    MARGE = 1.0
 
-        # Memòria històrica d'hores passades (permet consultar el passat dins de la simulació):
-        # self.historial = []
+    
+    CO2_REF = 0.084
+    PREU_REF = 0.143
+    W_CO2 = 0.7
+    W_PREU = 0.3
+
+    
+    H_EXTRA = 24 # hores extra previstes més enllà de les 24 conegudes
+    DESCOMPTE_EXTRA = 1.0 # confiança en la previsió extra
+    QUANTIL_TERMINAL = 0.5
+
+    def __init__(self):
+        self.net_hist = {} # (hora) -> deque de consums nets observats
+        self.w_hist = {} # (hora) -> deque de w observats
+        self.ultim_ts = None
+
+    def _registra(self, obs, w_ara):
+        hora = int(obs["hour"])
+        dades = obs.get("noves_dades_5min") or {}
+        net = float(dades.get("ultim_consum_kw", 0.0)) - float(dades.get("ultima_solar_kw", 0.0))
+        h_ant = (hora - 1) % 24
+        self.net_hist.setdefault(h_ant, deque(maxlen=7)).append(net)
+        self.w_hist.setdefault(hora, deque(maxlen=7)).append(w_ara)
+        return net
+
+    def _previsio_net(self, hora0, n, ultim_net):
+        out = np.empty(n)
+        for k in range(n):
+            hk = (hora0 + k) % 24
+            hist = self.net_hist.get(hk)
+            if hist:
+                out[k] = min(hist) # conservador: el mínim de la setmana
+            else:
+                out[k] = ultim_net
+        return np.maximum(out, 0.0)
+
+    def _previsio_w(self, hora0, n, w_conegut):
+        out = np.empty(n)
+        for k in range(n):
+            hk = (hora0 + k) % 24
+            hist = self.w_hist.get(hk)
+            # persistència: el valor conegut 24 h abans (mateixa hora) o la mitjana
+            out[k] = w_conegut[k % len(w_conegut)] if len(w_conegut) >= 24 else (
+                np.mean(hist) if hist else float(np.mean(w_conegut)))
+        return out
 
     def act(self, obs: dict) -> float:
-        """Determina la consigna de potència activa de la bateria per a l'hora actual.
+        soc = float(obs["soc_kwh"])
+        preus = np.asarray(obs.get("preus_properes_24h") or [obs["preu_actual"]], dtype=float)
+        co2 = np.asarray(obs.get("co2_properes_24h") or [obs["co2_actual"]], dtype=float)
+        h = int(min(len(preus), len(co2)))
+        if h == 0:
+            return 0.0
+        w = self.W_CO2 * co2[:h] / self.CO2_REF + self.W_PREU * preus[:h] / self.PREU_REF
 
-        Paràmetres:
-        -----------
-        obs : dict amb les variables d'estat disponibles a l'hora actual:
-            - "timestamp": pd.Timestamp amb la data i hora d'avaluació.
-            - "hour": int de 0 a 23 (hora del dia).
-            - "day_of_week": int de 0 (dilluns) a 6 (diumenge).
-            - "soc_kwh": float amb l'energia emmagatzemada actual (0.0 a 2.000.0 kWh).
-            - "soc_pct": float amb l'estat de càrrega relatiu [0.0, 1.0].
-            - "preu_actual": float amb el preu del PVPC d'aquesta hora (€/kWh).
-            - "co2_actual": float amb la intensitat de CO2 peninsular (kg CO2/kWh).
-            - "preus_properes_24h": llista de preus horaris de les properes 24 hores (€/kWh).
-            - "co2_properes_24h": llista de factors d'emissió de CO2 de les properes 24 hores (kg/kWh).
-            - "noves_dades_5min": dades mesurades pels sensors en la darrera hora transcorreguda.
+        ultim_net = self._registra(obs, float(w[0]))
+        hora0 = int(obs["hour"])
+        final_dades = h < 24 # final del període: l'energia restant no val res
 
-        Retorna:
-        --------
-        float : Consigna de potència activa en kW:
-            > 0  -> Càrrega d'energia des de la xarxa interna (fins a +500.0 kW).
-            < 0  -> Descàrrega d'energia cap al campus (fins a -500.0 kW).
-            = 0  -> Bateria en mode d'espera (0.0 kW).
-        """
-        hora = obs["hour"]
-        preu = obs["preu_actual"]
-        soc = obs["soc_pct"]
-        co2 = obs["co2_actual"]
+        if not final_dades and self.H_EXTRA > 0:
+            w_ext = self._previsio_w(hora0 + h, self.H_EXTRA, w) * self.DESCOMPTE_EXTRA
+            w_tot = np.concatenate([w, w_ext])
+        else:
+            w_tot = w
+        n = len(w_tot)
+        net = self._previsio_net(hora0, n, ultim_net)
 
-        # Política heurística de referència basada en regles temporals:
-        consigna = 0.0
-        # 1. Període vall nocturn (01:00 a 06:00): Càrrega en hores de baixa emissió i baix cost
-        if 1 <= hora <= 6 and preu < self.llindar_preu_carrega and soc < 0.85:
-            consigna = 350.0
+        try:
+            p = self._resol(soc, w_tot, net, final_dades)
+        except Exception:
+            p = 0.0
+        return self._seguretat(p, soc)
 
-        # 2. Període solar central (11:00 a 15:00): Càrrega d'aprofitament amb preus moderats
-        elif 11 <= hora <= 15 and preu < 0.10 and soc < 0.95:
-            consigna = 250.0
+    def _resol(self, soc0, w, net, final_dades):
+        n = len(w)
+        eta = self.ETA
+        smin, smax = self.MARGE, self.CAP - self.MARGE
+        v = 0.0 if final_dades else eta * float(np.quantile(w, self.QUANTIL_TERMINAL))
 
-        # 3. Període punta vespertí (18:00 a 22:00): Descàrrega per cobrir la demanda màxima del campus
-        elif 18 <= hora <= 22 and (preu > self.llindar_preu_descarrega or co2 > 0.10) and soc > 0.15:
-            consigna = -450.0
+        # Variables: c (n), d (n), g (n)
+        # SOC_h = soc0 + sum(eta c - d/eta) ; objectiu: sum w g - v*SOC_n
+        cost = np.concatenate([np.full(n, -v * eta), np.full(n, v / eta), w])
 
-        # Clamping de seguretat física per evitar infraccions de retallada (clipping):
-        # Capacitat màxima: 2.000 kWh, Rendiment: sqrt(0.90) ~= 0.9487
-        soc_kwh = float(obs["soc_kwh"])
-        rendiment_eta = 0.9487
-        max_carrega = min(self.potencia_nominal_kw, (2000.0 - soc_kwh) / rendiment_eta)
-        max_descarrega = min(self.potencia_nominal_kw, soc_kwh * rendiment_eta)
+        L = np.tril(np.ones((n, n)))
+        Z = np.zeros((n, n))
+        I = np.eye(n)
+        A_soc = np.hstack([eta * L, -L / eta, Z])
+        # g >= net + c - d   ->   c - d - g <= -net
+        A_g = np.hstack([I, -I, -I])
+        A_ub = np.vstack([A_soc, -A_soc, A_g])
+        b_ub = np.concatenate([np.full(n, smax - soc0), np.full(n, soc0 - smin), -net])
+        bounds = [(0.0, self.PMAX)] * (2 * n) + [(0.0, None)] * n
 
-        return float(max(-max_descarrega, min(max_carrega, consigna)))
+        res = linprog(cost, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method="highs")
+        if res.status != 0:
+            return 0.0
+        return float(res.x[0] - res.x[n])
+
+    def _seguretat(self, p, soc):
+        max_c = max(0.0, (self.CAP - self.MARGE - soc) / self.ETA)
+        max_d = max(0.0, (soc - self.MARGE) * self.ETA)
+        p = max(-min(self.PMAX, max_d), min(min(self.PMAX, max_c), p))
+        return 0.0 if abs(p) < 1e-6 else float(p)
